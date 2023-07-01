@@ -224,6 +224,28 @@ function LintMemberProperty(path) {
   path.replaceWith(t.memberExpression(object, property.left, computed))
 }
 
+function DecodeRename(ast) {
+  let name_count = 1000
+  traverse(ast, {
+    FunctionDeclaration(path) {
+      if (!path.node?.id?.name) {
+        return
+      }
+      let s = path.scope.generateUidIdentifier(`_u${name_count++}f`)
+      path.scope.rename(path.node.id.name, s.name)
+      for (let it of path.node.params) {
+        s = path.scope.generateUidIdentifier(`_u${name_count++}p`)
+        path.scope.rename(it.name, s.name)
+      }
+    },
+    VariableDeclarator(path) {
+      const s = path.scope.generateUidIdentifier(`_u${name_count++}v`)
+      path.scope.rename(path.node.id.name, s.name)
+    },
+  })
+  console.info(`Count: ${name_count}`)
+}
+
 export default function (code) {
   let ast = parse(code)
   // Lint
@@ -258,6 +280,8 @@ export default function (code) {
   traverse(ast, {
     MemberExpression: LintMemberProperty,
   })
+  // Extract methods
+  DecodeRename(ast)
 
   code = generator(ast, {
     comments: false,
