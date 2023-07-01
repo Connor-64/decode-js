@@ -195,6 +195,20 @@ function LintSequence(path) {
   return
 }
 
+function LintFunction(path) {
+  let { id, params, body } = path.node
+  if (id || params.length) {
+    return
+  }
+  if (
+    path.getFunctionParent() &&
+    path.parentPath.isCallExpression() &&
+    path.parentPath.parentPath.isUnaryExpression({ operator: '!' })
+  ) {
+    path.parentPath.parentPath.parentPath.replaceWith(body)
+  }
+}
+
 function LintBlock(path) {
   let { body } = path.node
   if (!body.length) {
@@ -235,7 +249,7 @@ function LintMemberProperty(path) {
   path.replaceWith(t.memberExpression(object, property.left, computed))
 }
 
-function DecodeRename(ast) {
+function RenameIdentifier(ast) {
   let name_count = 1000
   traverse(ast, {
     FunctionDeclaration(path) {
@@ -391,6 +405,8 @@ function DecodeForSwitchIf(ast) {
 
 export default function (code) {
   let ast = parse(code)
+  // Generate unique name for all identifiers
+  RenameIdentifier(ast)
   // Lint
   traverse(ast, {
     UnaryExpression: RemoveVoid,
@@ -421,13 +437,15 @@ export default function (code) {
     SequenceExpression: { exit: LintSequence },
   })
   traverse(ast, {
+    FunctionExpression: LintFunction,
+  })
+  traverse(ast, {
     BlockStatement: { exit: LintBlock },
   })
   traverse(ast, {
     MemberExpression: LintMemberProperty,
   })
   // Extract methods
-  DecodeRename(ast)
   DecodeForSwitchIf(ast)
 
   code = generator(ast, {
