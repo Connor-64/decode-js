@@ -227,7 +227,7 @@ function LintMemberProperty(path) {
     return
   }
   let upper = path.findParent((path) => path.isExpressionStatement())
-  if (!upper || !t.isBlockStatement(upper.parent)) {
+  if (!upper.node || !t.isBlockStatement(upper.parent)) {
     return
   }
   // console.log(`move: ${generator(path.node).code}`)
@@ -255,6 +255,138 @@ function DecodeRename(ast) {
     },
   })
   console.info(`Count: ${name_count}`)
+}
+
+function DecodeForSwitchIf(ast) {
+  let info_choice = {}
+  let info_key = {}
+  // Collect vars
+  const visitor_checker = {
+    Identifier(path) {
+      info_choice[this.name].parent = path.node.name
+      path.stop()
+    },
+  }
+  traverse(ast, {
+    VariableDeclarator(path) {
+      let { id, init } = path.node
+      if (
+        !t.isBinaryExpression(init, { operator: '&' }) ||
+        !t.isNumericLiteral(init.left)
+      ) {
+        return
+      }
+      const name = id.name
+      const binding = path.scope.getBinding(name)
+      if (!binding || !binding.constant) {
+        return
+      }
+      let upper1 = path.findParent((path) => path.isVariableDeclaration())
+      if (!upper1.node) {
+        return
+      }
+      let upper2 = path.findParent((path) => path.isForStatement())
+      if (!upper2.node) {
+        return
+      }
+      if (upper2.node.body.body.length !== 2) {
+        console.warn('Unexpected block length of for statement!')
+      }
+      let pname = upper2.node.init?.declarations[0]?.id?.name
+      info_choice[name] = {
+        range: init.left.value + 1,
+        code: generator(upper1.node).code,
+        root: pname,
+      }
+      if (!(pname in info_key)) {
+        info_key[pname] = []
+      }
+      info_key[pname].push(name)
+      path.get('init').traverse(visitor_checker, { name: name })
+    },
+  })
+  for (const p in info_choice) {
+    console.info(`Var: ${p} Root: ${info_choice[p].root}`)
+  }
+  // Transform if-else to switch
+  let name
+  let code
+  let last
+  function dfs(node, candidate) {
+    const test = generator(node.test).code
+    // console.log(test)
+    let left = [],
+      right = []
+    for (const c of candidate) {
+      if (eval(`let ${name}=${c}; ${test}`)) {
+        left.push(c)
+      } else {
+        right.push(c)
+      }
+    }
+    const hasNext = (node) => {
+      if (!t.isIfStatement(node.body[0])) {
+        return false
+      }
+      return node.body[0].test.left?.name === name
+    }
+    if (hasNext(node.consequent)) {
+      dfs(node.consequent.body[0], left)
+    } else if (left.length == 1) {
+      code[left[0]] = node.consequent.body
+    } else {
+      if (last) {
+        console.error('Multiple default choice!')
+        throw new Error()
+      }
+      last = node.consequent.body
+    }
+    if (!node.alternate) {
+      return
+    }
+    if (hasNext(node.alternate)) {
+      dfs(node.alternate.body[0], right)
+    } else if (right.length == 1) {
+      code[right[0]] = node.alternate.body
+    } else {
+      if (last) {
+        console.error('Multiple default choice!')
+      }
+      last = node.alternate.body
+    }
+  }
+  traverse(ast, {
+    IfStatement(path) {
+      let path_test = path.get('test')
+      if (!path_test.isBinaryExpression()) {
+        return
+      }
+      name = path_test.node.left?.name
+      if (!(name in info_choice)) {
+        return
+      }
+      code = Array(info_choice[name].range)
+      let candidate = Array.from(code.keys())
+      last = null
+      dfs(path.node, candidate)
+      let cases = []
+      for (let i = 0; i < code.length; ++i) {
+        if (!code[i]) {
+          break
+        }
+        code[i].push(t.breakStatement())
+        cases.push(
+          t.switchCase(t.numericLiteral(i), [t.blockStatement(code[i])])
+        )
+      }
+      if (last) {
+        cases.push(t.switchCase(null, [t.blockStatement(last)]))
+      }
+      const repl = t.switchStatement(t.identifier(name), cases)
+      path.replaceWith(repl)
+    },
+  })
+  // Flatten switch
 }
 
 export default function (code) {
@@ -296,6 +428,7 @@ export default function (code) {
   })
   // Extract methods
   DecodeRename(ast)
+  DecodeForSwitchIf(ast)
 
   code = generator(ast, {
     comments: false,
