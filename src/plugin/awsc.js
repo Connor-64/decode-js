@@ -207,6 +207,23 @@ function LintBlock(path) {
   path.replaceWith(t.blockStatement(arr))
 }
 
+function LintMemberProperty(path) {
+  let { object, property, computed } = path.node
+  if (
+    !t.isAssignmentExpression(property, { operator: '+=' }) ||
+    !t.isIdentifier(property.left)
+  ) {
+    return
+  }
+  let upper = path.findParent((path) => path.isExpressionStatement())
+  if (!upper || !t.isBlockStatement(upper.parent)) {
+    return
+  }
+  // console.log(`move: ${generator(path.node).code}`)
+  upper.insertBefore(t.expressionStatement(property))
+  path.replaceWith(t.memberExpression(object, property.left, computed))
+}
+
 export default function (code) {
   let ast = parse(code)
   // Lint
@@ -237,6 +254,9 @@ export default function (code) {
   })
   traverse(ast, {
     BlockStatement: { exit: LintBlock },
+  })
+  traverse(ast, {
+    MemberExpression: LintMemberProperty,
   })
 
   code = generator(ast, {
