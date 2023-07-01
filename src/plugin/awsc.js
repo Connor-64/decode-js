@@ -128,7 +128,7 @@ function LintIfStatement(path) {
   path.replaceWith(t.ifStatement(test, consequent, alternate))
 }
 
-function LintIfTest(path) {
+function LintIfTestSequence(path) {
   let { test, consequent, alternate } = path.node
   if (!t.isSequenceExpression(test)) {
     return
@@ -141,6 +141,17 @@ function LintIfTest(path) {
   let before = t.expressionStatement(t.sequenceExpression(body))
   path.insertBefore(before)
   path.replaceWith(t.ifStatement(last, consequent, alternate))
+}
+
+function LintIfTestBinary(path) {
+  let path_test = path.get('test')
+  if (!path_test.isBinaryExpression({ operator: '==' })) {
+    return
+  }
+  let { left, right } = path_test.node
+  if (t.isNumericLiteral(left) && t.isIdentifier(right)) {
+    path_test.replaceWith(t.binaryExpression('==', right, left))
+  }
 }
 
 function LintSwitchCase(path) {
@@ -263,7 +274,10 @@ export default function (code) {
     IfStatement: { exit: LintIfStatement },
   })
   traverse(ast, {
-    IfStatement: { enter: LintIfTest },
+    IfStatement: { enter: LintIfTestSequence },
+  })
+  traverse(ast, {
+    IfStatement: { exit: LintIfTestBinary },
   })
   traverse(ast, {
     SwitchCase: { enter: LintSwitchCase },
