@@ -12,7 +12,12 @@ const traverse = _traverse.default
 
 function RemoveVoid(path) {
   if (path.node.operator === 'void') {
-    path.replaceWith(path.node.argument)
+    const code = generator(path.node).code
+    if (code === 'void 0') {
+      path.replaceWith(t.identifier('undefined'))
+    } else {
+      path.replaceWith(path.node.argument)
+    }
   }
 }
 
@@ -268,12 +273,13 @@ function RenameIdentifier(ast) {
       path.scope.rename(path.node.id.name, s.name)
     },
   })
-  console.info(`Count: ${name_count}`)
+  console.info(`Count: ${name_count - 1000}`)
 }
 
-function DecodeForSwitchIf(ast) {
-  let info_choice = {}
-  let info_key = {}
+let info_choice = {}
+let info_key = {}
+
+function CollectVars(ast) {
   // Collect vars
   const visitor_checker = {
     Identifier(path) {
@@ -309,19 +315,59 @@ function DecodeForSwitchIf(ast) {
       let pname = upper2.node.init?.declarations[0]?.id?.name
       info_choice[name] = {
         range: init.left.value + 1,
-        code: generator(upper1.node).code,
         root: pname,
       }
       if (!(pname in info_key)) {
-        info_key[pname] = []
+        const start = upper2.node.init.declarations[0].init.value
+        info_key[pname] = {
+          start: start,
+          code: generator(upper1.node).code,
+          child: { pname: pname },
+          value: {},
+          visit: 0,
+        }
       }
-      info_key[pname].push(name)
+      info_key[pname].child[name] = name
       path.get('init').traverse(visitor_checker, { name: name })
     },
   })
   for (const p in info_choice) {
     console.info(`Var: ${p} Root: ${info_choice[p].root}`)
   }
+}
+
+function UpdateRef(ast) {
+  const visitor_value = {
+    AssignmentExpression(path) {
+      if (path.node.left?.name === this.name) {
+        const value = path.node.right.value
+        if (value === undefined) {
+          return
+        }
+        if (!(value in info_key[this.name].value)) {
+          info_key[this.name].value[value] = 0
+        }
+        ++info_key[this.name].value[value]
+      }
+    },
+  }
+  traverse(ast, {
+    VariableDeclarator(path) {
+      let { id, init } = path.node
+      if (id.name in info_key) {
+        let upper2 = path.findParent((path) => path.isForStatement())
+        info_key[id.name].value = {}
+        info_key[id.name].value[init.value] = 1
+        upper2.get('body.body.1').traverse(visitor_value, { name: id.name })
+      }
+    },
+  })
+  for (const p in info_key) {
+    console.info(`Key: ${p} Size: ${Object.keys(info_key[p].value).length}`)
+  }
+}
+
+function FlattenIf(ast) {
   // Transform if-else to switch
   let name
   let code
@@ -329,8 +375,8 @@ function DecodeForSwitchIf(ast) {
   function dfs(node, candidate) {
     const test = generator(node.test).code
     // console.log(test)
-    let left = [],
-      right = []
+    let left = []
+    let right = []
     for (const c of candidate) {
       if (eval(`let ${name}=${c}; ${test}`)) {
         left.push(c)
@@ -394,20 +440,167 @@ function DecodeForSwitchIf(ast) {
         )
       }
       if (last) {
+        last.push(t.breakStatement())
         cases.push(t.switchCase(null, [t.blockStatement(last)]))
       }
       const repl = t.switchStatement(t.identifier(name), cases)
       path.replaceWith(repl)
     },
   })
+}
+
+function FlattenSwitch(ast) {
   // Flatten switch
+  function dfs2(path, candidate, key, cases) {
+    let mp = {}
+    for (const c of candidate) {
+      let code = `var ${key}=${c};${info_key[key].code}`
+      let test = generator(path.node.discriminant).code
+      let value = eval(code + test)
+      if (!(value in mp)) {
+        mp[value] = []
+      }
+      mp[value].push(c)
+    }
+    for (let i in path.node.cases) {
+      const choice = path.get(`cases.${i}`)
+      let body, c
+      if (!choice.node.test) {
+        const keys = Object.keys(mp)
+        if (keys.length != 1) {
+          throw new Error('Key - Case miss match!')
+        }
+        c = keys[0]
+      } else {
+        c = choice.node.test.value
+      }
+      body = choice.node.consequent[0].body
+      if (!(c in mp)) {
+        console.warn(`Drop in key: ${key}`)
+        continue
+      }
+      if (mp[c].length > 1) {
+        if (body.length > 2) {
+          console.error('Not empty before switch case')
+        }
+        dfs2(choice.get('consequent.0.body.0'), mp[c], key, cases)
+      } else {
+        const value = Number.parseInt(mp[c][0])
+        if (body.length >= 2 && t.isIfStatement(body.at(-2))) {
+          let line = body.at(-2)
+          line.consequent.body.push(t.breakStatement())
+          line.alternate.body.push(t.breakStatement())
+          body.pop()
+        }
+        cases[value] = body
+      }
+      delete mp[c]
+    }
+  }
+  // Merge switch
+  let updated
+  function dfs3(cases, vis, body, update, key, value) {
+    if (update && value in vis) {
+      return
+    }
+    vis[value] = 1
+    let valid = true
+    let last = -1
+    while (valid) {
+      if (t.isReturnStatement(body.at(-1))) {
+        break
+      }
+      if (t.isIfStatement(body.at(-1))) {
+        valid = false
+        const choices = [body.at(-1).consequent, body.at(-1).alternate]
+        const ret = []
+        for (let c of choices) {
+          ret.push(dfs3(cases, vis, c.body, false, key, value))
+        }
+        if (ret[0] == ret[1] && ~ret[0]) {
+          let mv = choices[0].body.splice(choices[0].body.length - 2, 2)
+          choices[1].body.splice(choices[1].body.length - 2, 2)
+          body.push(...mv)
+          --info_key[key].value[ret[0]]
+          valid = true
+          updated = true
+          continue
+        }
+        if (value === ret[0]) {
+          const arg = choices[0].body.at(-3)?.expression?.argument?.name
+          const test = body.at(-1).test
+          if (arg && ~generator(test).code.indexOf(arg)) {
+            const body1 = choices[0].body.slice(0, -2)
+            const repl = t.whileStatement(test, t.blockStatement(body1))
+            body.pop()
+            body.push(repl)
+            if (choices[1].body) {
+              body.push(...choices[1].body)
+            }
+            --info_key[key].value[ret[0]]
+            console.info(`merge inner while-loop: ${key}:${ret[0]}`)
+            valid = true
+            updated = true
+            continue
+          }
+        }
+      } else {
+        let next = body.at(-2).expression.right.value
+        if (next === undefined) {
+          break
+        }
+        if (info_key[key].value[next] > 1) {
+          dfs3(cases, vis, cases[next], true, key, next)
+          last = next
+          break
+        }
+        body.splice(body.length - 2, 2)
+        body.push(...cases[next])
+        delete cases[next]
+        updated = true
+        // console.log(`merge ${key}:${next}->${value}`)
+      }
+    }
+    if (update) {
+      cases[value] = body
+    }
+    return last
+  }
+  traverse(ast, {
+    ForStatement(path) {
+      let key = path.node.init?.declarations[0]?.id?.name
+      if (!(key in info_key) || info_key[key].visit) {
+        return
+      }
+      let cases = {}
+      let candidate = Object.keys(info_key[key].value)
+      dfs2(path.get('body.body.1'), candidate, key, cases)
+      let start = info_key[key].start
+      updated = true
+      while (updated) {
+        updated = false
+        dfs3(cases, {}, cases[start], true, key, start)
+      }
+      let body = []
+      for (let value in cases) {
+        body.push(
+          t.switchCase(t.numericLiteral(Number.parseInt(value)), [
+            t.blockStatement(cases[value]),
+          ])
+        )
+      }
+      const repl = t.switchStatement(t.identifier(key), body)
+      path.get('body.body.1').replaceWith(repl)
+      info_key[key].visit = 1
+    },
+  })
 }
 
 export default function (code) {
   let ast = parse(code)
   // Generate unique name for all identifiers
   RenameIdentifier(ast)
-  // Lint
+  // Pre Lint
   traverse(ast, {
     UnaryExpression: RemoveVoid,
   })
@@ -442,12 +635,16 @@ export default function (code) {
   traverse(ast, {
     BlockStatement: { exit: LintBlock },
   })
+  // Extract methods
+  CollectVars(ast)
+  FlattenIf(ast)
+  UpdateRef(ast)
+  FlattenSwitch(ast)
+  // Post Lint
   traverse(ast, {
     MemberExpression: LintMemberProperty,
   })
-  // Extract methods
-  DecodeForSwitchIf(ast)
-
+  // Generate code
   code = generator(ast, {
     comments: false,
     jsescOption: { minimal: true },
