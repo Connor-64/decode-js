@@ -237,23 +237,6 @@ function LintBlock(path) {
   path.replaceWith(t.blockStatement(arr))
 }
 
-function LintMemberProperty(path) {
-  let { object, property, computed } = path.node
-  if (
-    !t.isAssignmentExpression(property, { operator: '+=' }) ||
-    !t.isIdentifier(property.left)
-  ) {
-    return
-  }
-  let upper = path.findParent((path) => path.isExpressionStatement())
-  if (!upper.node || !t.isBlockStatement(upper.parent)) {
-    return
-  }
-  // console.log(`move: ${generator(path.node).code}`)
-  upper.insertBefore(t.expressionStatement(property))
-  path.replaceWith(t.memberExpression(object, property.left, computed))
-}
-
 function RenameIdentifier(ast) {
   let name_count = 1000
   traverse(ast, {
@@ -596,6 +579,78 @@ function FlattenSwitch(ast) {
   })
 }
 
+function FlattenFor(ast) {
+  traverse(ast, {
+    ForStatement(path) {
+      let { init, test, update, body } = path.node
+      if (!update || generator(update).code.indexOf('++') == -1) {
+        return
+      }
+      body.body.push(t.expressionStatement(update))
+      path.insertBefore(init)
+      const repl = t.whileStatement(test, body)
+      path.replaceWith(repl)
+    },
+  })
+}
+
+function SplitVarDef(ast) {
+  traverse(ast, {
+    VariableDeclaration(path) {
+      if (t.isForStatement(path.parent)) {
+        return
+      }
+      const kind = path.node.kind
+      const list = path.node.declarations
+      if (list.length == 1) {
+        return
+      }
+      for (let item of list) {
+        path.insertBefore(t.variableDeclaration(kind, [item]))
+      }
+      path.remove()
+    },
+  })
+}
+
+function MoveAssignment(ast) {
+  // post order traversal
+  let visitor = {
+    AssignmentExpression:{
+      exit(path) {
+        if (path.parentPath.isExpressionStatement()) {
+          return
+        }
+        let { left } = path.node
+        this.current.insertBefore(t.ExpressionStatement(path.node))
+        path.replaceWith(left)
+      }
+    },
+  }
+  traverse(ast, {
+    ExpressionStatement(path) {
+      if (!t.isBlockStatement(path.parent)) {
+        return
+      }
+      path.traverse(visitor, { current: path })
+    },
+  })
+}
+
+function MergeString(ast) {
+  traverse(ast, {
+    VariableDeclarator(path) {
+      const name = path.node.id.name
+      const binding = path.scope.getBinding(name)
+      console.log(name, binding.references + binding.constantViolations.length)
+      return
+      for (let it of binding.referencePaths) {
+        console.log(generator(it.parent).code)
+      }
+    },
+  })
+}
+
 export default function (code) {
   let ast = parse(code)
   // Generate unique name for all identifiers
@@ -640,11 +695,12 @@ export default function (code) {
   FlattenIf(ast)
   UpdateRef(ast)
   FlattenSwitch(ast)
+  FlattenFor(ast)
   // Post Lint
-  traverse(ast, {
-    MemberExpression: LintMemberProperty,
-  })
-  // Generate code
+  // The Variable Declaration list must be splitted first
+  SplitVarDef(ast)
+  // Then, the assignment should be splitted
+  MoveAssignment(ast)
   code = generator(ast, {
     comments: false,
     jsescOption: { minimal: true },
