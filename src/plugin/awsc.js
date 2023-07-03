@@ -616,7 +616,7 @@ function SplitVarDef(ast) {
 function MoveAssignment(ast) {
   // post order traversal
   let visitor = {
-    AssignmentExpression:{
+    AssignmentExpression: {
       exit(path) {
         if (path.parentPath.isExpressionStatement()) {
           return
@@ -624,11 +624,23 @@ function MoveAssignment(ast) {
         let { left } = path.node
         this.current.insertBefore(t.ExpressionStatement(path.node))
         path.replaceWith(left)
-      }
+      },
     },
   }
   traverse(ast, {
-    ExpressionStatement(path) {
+    IfStatement(path) {
+      if (!t.isBlockStatement(path.parent)) {
+        return
+      }
+      let test = path.get('test')
+      if (test.isAssignmentExpression()) {
+        path.insertBefore(t.expressionStatement(test.node))
+        test.replaceWith(test.node.left)
+      }
+    },
+  })
+  traverse(ast, {
+    'ExpressionStatement|VariableDeclaration'(path) {
       if (!t.isBlockStatement(path.parent)) {
         return
       }
@@ -638,15 +650,102 @@ function MoveAssignment(ast) {
 }
 
 function MergeString(ast) {
+  const visitor_block = {
+    BlockStatement: {
+      exit(path) {
+        let info = {}
+        const check_ep = (ep) => {
+          let modified = false
+          let { operator, left, right } = ep.node
+          if (t.isIdentifier(left) && t.isStringLiteral(right)) {
+            const name = left.name
+            const value = right.value
+            if (operator === '+=' && name in info) {
+              if (info[name].used) {
+                delete info[name]
+              } else {
+                info[name].value += value
+                info[name].path.replaceWith(t.stringLiteral(info[name].value))
+                ep.remove()
+                modified = true
+              }
+            }
+            if (operator === '=') {
+              info[name] = {
+                value: value,
+                path: ep.get('right'),
+                used: false,
+              }
+            }
+            return modified
+          }
+          let code = generator(ep.node).code
+          for (let key in info) {
+            let test = `${key}.split("").reverse().join("")`
+            let idx = code.indexOf(test)
+            if (~idx) {
+              let pfx = generator(info[key].path.parent).code
+              const res = eval(`let ${pfx};${test}`)
+              const repl = generator(t.stringLiteral(res)).code
+              code = code.replace(test, repl)
+              ep.replaceWithSourceString(code)
+              info[key].used = true
+              modified = true
+              continue
+            }
+            if (~code.indexOf(key)) {
+              info[key].used = true
+            }
+          }
+          return modified
+        }
+        for (let i in path.node.body) {
+          let line = path.get(`body.${i}`)
+          if (line.isVariableDeclaration()) {
+            const node = line.node.declarations[0]
+            if (!node.init || !t.isStringLiteral(node.init)) {
+              continue
+            }
+            info[node.id.name] = {
+              value: node.init.value,
+              path: line.get('declarations.0.init'),
+              used: false,
+            }
+            continue
+          }
+          if (t.isAssignmentExpression(line.node?.expression)) {
+            let modified = true
+            while (
+              modified &&
+              t.isAssignmentExpression(line.node?.expression)
+            ) {
+              modified = check_ep(line.get('expression'))
+              line = path.get(`body.${i}`)
+            }
+            continue
+          }
+          if (t.isExpressionStatement(line.node)) {
+            const ep = line.get('expression')
+            if (
+              ep.isUpdateExpression() ||
+              ep.isUnaryExpression() ||
+              ep.isMemberExpression()
+            ) {
+              continue
+            }
+            info = {}
+          }
+          if (line.isBreakStatement() || line.isReturnStatement()) {
+            continue
+          }
+          info = {}
+        }
+      },
+    },
+  }
   traverse(ast, {
-    VariableDeclarator(path) {
-      const name = path.node.id.name
-      const binding = path.scope.getBinding(name)
-      console.log(name, binding.references + binding.constantViolations.length)
-      return
-      for (let it of binding.referencePaths) {
-        console.log(generator(it.parent).code)
-      }
+    SwitchCase(path) {
+      path.traverse(visitor_block)
     },
   })
 }
@@ -701,6 +800,9 @@ export default function (code) {
   SplitVarDef(ast)
   // Then, the assignment should be splitted
   MoveAssignment(ast)
+  // The string can be merged
+  MergeString(ast)
+  // Generate code
   code = generator(ast, {
     comments: false,
     jsescOption: { minimal: true },
