@@ -750,6 +750,60 @@ function MergeString(ast) {
   })
 }
 
+function ProcessWhile(ast) {
+  const visitor = {
+    Identifier(path) {
+      const name = path.node.name
+      if (name.indexOf('_u') === 0) {
+        this.line.push(`var ${path.node.name}`)
+      }
+    },
+  }
+  traverse(ast, {
+    WhileStatement(path) {
+      if (!path.parentPath.isBlockStatement()) {
+        return
+      }
+      const code = generator(path.node).code
+      const re = new RegExp('(_u[0-9]+v) \\+= String.fromCharCode', 'g')
+      const match = [...code.matchAll(re)]
+      if (match.length !== 1) {
+        return
+      }
+      const name = match[0][1]
+      let line = []
+      path.traverse(visitor, { line: line })
+      for (let i = 0; i < path.key; ++i) {
+        try {
+          const node = path.parent[path.listKey][i]
+          let c = generator(node).code
+          if (t.isExpressionStatement(node)) {
+            c = 'var ' + c
+          }
+          eval(c)
+          line.push(c)
+        } catch {}
+      }
+      line.push(code)
+      line.push(name)
+      try {
+        let res = eval(line.join(';'))
+        path.replaceWith(
+          t.expressionStatement(
+            t.assignmentExpression(
+              '=',
+              t.identifier(name),
+              t.stringLiteral(res)
+            )
+          )
+        )
+      } catch {
+        console.warn(`prase while ${name} failed`)
+      }
+    },
+  })
+}
+
 export default function (code) {
   let ast = parse(code)
   // Generate unique name for all identifiers
@@ -802,6 +856,8 @@ export default function (code) {
   MoveAssignment(ast)
   // The string can be merged
   MergeString(ast)
+  // Simplify while that contains String.fromCharCode
+  ProcessWhile(ast)
   // Generate code
   code = generator(ast, {
     comments: false,
