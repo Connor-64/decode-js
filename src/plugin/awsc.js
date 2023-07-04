@@ -747,6 +747,19 @@ function MoveAssignment(ast) {
       if (test.isAssignmentExpression()) {
         path.insertBefore(t.expressionStatement(test.node))
         test.replaceWith(test.node.left)
+        return
+      }
+      if (test.isMemberExpression()) {
+        let property = test.get('property')
+        if (property.isAssignmentExpression()) {
+          path.insertBefore(t.expressionStatement(property.node))
+          property.replaceWith(property.node.left)
+        }
+        let object = test.get('object')
+        if (object.isAssignmentExpression()) {
+          path.insertBefore(t.expressionStatement(object.node))
+          object.replaceWith(object.node.left)
+        }
       }
     },
   })
