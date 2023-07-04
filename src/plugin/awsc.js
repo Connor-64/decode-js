@@ -319,37 +319,6 @@ function CollectVars(ast) {
   }
 }
 
-function UpdateRef(ast) {
-  const visitor_value = {
-    AssignmentExpression(path) {
-      if (path.node.left?.name === this.name) {
-        const value = path.node.right.value
-        if (value === undefined) {
-          return
-        }
-        if (!(value in info_key[this.name].value)) {
-          info_key[this.name].value[value] = 0
-        }
-        ++info_key[this.name].value[value]
-      }
-    },
-  }
-  traverse(ast, {
-    VariableDeclarator(path) {
-      let { id, init } = path.node
-      if (id.name in info_key) {
-        let upper2 = path.findParent((path) => path.isForStatement())
-        info_key[id.name].value = {}
-        info_key[id.name].value[init.value] = 1
-        upper2.get('body.body.1').traverse(visitor_value, { name: id.name })
-      }
-    },
-  })
-  for (const p in info_key) {
-    console.info(`Key: ${p} Size: ${Object.keys(info_key[p].value).length}`)
-  }
-}
-
 function FlattenIf(ast) {
   // Transform if-else to switch
   let name
@@ -433,6 +402,98 @@ function FlattenIf(ast) {
 }
 
 function FlattenSwitch(ast) {
+  const visitor_value = {
+    AssignmentExpression(path) {
+      if (path.node.left?.name === this.name) {
+        const value = path.node.right.value
+        if (value === undefined) {
+          return
+        }
+        if (!(value in info_key[this.name].value)) {
+          info_key[this.name].value[value] = 0
+        }
+        ++info_key[this.name].value[value]
+      }
+    },
+  }
+  // Convert binary equation to value
+  const visitor_binary = {
+    BlockStatement: {
+      exit(path) {
+        let info = {}
+        const check_ep = (ep) => {
+          let { operator, left, right } = ep.node
+          if (!t.isIdentifier(left)) {
+            return
+          }
+          const name = left.name
+          let pfx = ''
+          if (operator === '=') {
+            if (t.isNumericLiteral(right) || t.isBooleanLiteral(right)) {
+              info[name] = right.value
+              return
+            }
+            if (!t.isBinaryExpression(right) && !t.isIdentifier(right)) {
+              if (name in info) {
+                delete info[name]
+              }
+              return
+            }
+            let test = generator(right).code
+            if (test.indexOf(name) === -1) {
+              pfx = 'var'
+            }
+          }
+          let code = ''
+          for (let key in info) {
+            code += `var ${key}=${info[key]};`
+          }
+          code += `${pfx} ${generator(ep.node).code};${name}`
+          try {
+            let res = eval(code)
+            ep.replaceWithSourceString(`${name}=${res}`)
+            info[name] = res
+          } catch {
+            if (operator === '=' && name in info) {
+              delete info[name]
+            }
+          }
+        }
+        for (let i in path.node.body) {
+          let line = path.get(`body.${i}`)
+          if (t.isAssignmentExpression(line.node?.expression)) {
+            check_ep(line.get('expression'))
+            continue
+          }
+          if (t.isExpressionStatement(line.node)) {
+            const ep = line.get('expression')
+            if (
+              ep.isUpdateExpression() ||
+              ep.isUnaryExpression() ||
+              ep.isMemberExpression()
+            ) {
+              continue
+            }
+          }
+          if (line.isIfStatement()) {
+            let test = line.get('test')
+            let code = ''
+            for (let key in info) {
+              code += `var ${key}=${info[key]};`
+            }
+            code += generator(test.node).code
+            try {
+              let res = eval(code)
+              test.replaceWithSourceString(res)
+            } catch {
+              //
+            }
+          }
+          info = {}
+        }
+      },
+    },
+  }
   // Flatten switch
   function dfs2(path, candidate, key, cases) {
     let mp = {}
@@ -459,7 +520,7 @@ function FlattenSwitch(ast) {
       }
       body = choice.node.consequent[0].body
       if (!(c in mp)) {
-        console.warn(`Drop in key: ${key}`)
+        console.warn(`drop key ${key}:${c}`)
         continue
       }
       if (mp[c].length > 1) {
@@ -495,10 +556,28 @@ function FlattenSwitch(ast) {
       }
       if (t.isIfStatement(body.at(-1))) {
         valid = false
+        const test = body.at(-1).test
         const choices = [body.at(-1).consequent, body.at(-1).alternate]
         const ret = []
         for (let c of choices) {
           ret.push(dfs3(cases, vis, c.body, false, key, value))
+        }
+        if (t.isBooleanLiteral(test) || t.isNumericLiteral(test)) {
+          let add = 0
+          if (!test.value) {
+            add = 1
+          }
+          let del = 1 - add
+          body.pop()
+          body.push(...choices[add].body)
+          // Some refs will be missed here if there's > 1 refs
+          if (~ret[del]) {
+            --info_key[key].value[ret[del]]
+          }
+          console.info(`delete if branch: ${key}:${ret[del]}`)
+          valid = true
+          updated = true
+          continue
         }
         if (ret[0] == ret[1] && ~ret[0]) {
           let mv = choices[0].body.splice(choices[0].body.length - 2, 2)
@@ -511,7 +590,6 @@ function FlattenSwitch(ast) {
         }
         if (value === ret[0]) {
           const arg = choices[0].body.at(-3)?.expression?.argument?.name
-          const test = body.at(-1).test
           if (arg && ~generator(test).code.indexOf(arg)) {
             const body1 = choices[0].body.slice(0, -2)
             const repl = t.whileStatement(test, t.blockStatement(body1))
@@ -555,25 +633,58 @@ function FlattenSwitch(ast) {
       if (!(key in info_key) || info_key[key].visit) {
         return
       }
+      const idx = path.node.body.body.length - 1
+      const path_switch = path.get(`body.body.${idx}`)
+      const start = info_key[key].start
+      // Helper func
+      let replace_switch = (nodes) => {
+        let body = []
+        for (let value in nodes) {
+          body.push(
+            t.switchCase(t.numericLiteral(Number.parseInt(value)), [
+              t.blockStatement(nodes[value]),
+            ])
+          )
+        }
+        const repl = t.switchStatement(t.identifier(key), body)
+        path_switch.replaceWith(repl)
+      }
+      let collect_switch = () => {
+        const list = path_switch.node.cases
+        const out = {}
+        for (let item of list) {
+          out[item.test.value] = item.consequent[0].body
+        }
+        return out
+      }
+      let update_ref = () => {
+        info_key[key].value = {}
+        info_key[key].value[start] = 1
+        path_switch.traverse(visitor_value, { name: key })
+        console.info(
+          `Key: ${key} Size: ${Object.keys(info_key[key].value).length}`
+        )
+      }
+      // Get all the cases
+      update_ref()
       let cases = {}
       let candidate = Object.keys(info_key[key].value)
-      dfs2(path.get('body.body.1'), candidate, key, cases)
-      let start = info_key[key].start
+      dfs2(path_switch, candidate, key, cases)
+      // Update first
+      replace_switch(cases)
       updated = true
       while (updated) {
         updated = false
+        // Convert binary
+        path.traverse(visitor_binary)
+        cases = collect_switch()
+        // Marge cases
         dfs3(cases, {}, cases[start], true, key, start)
+        // Replace
+        replace_switch(cases)
+        // Get the summary of this switch case
+        update_ref()
       }
-      let body = []
-      for (let value in cases) {
-        body.push(
-          t.switchCase(t.numericLiteral(Number.parseInt(value)), [
-            t.blockStatement(cases[value]),
-          ])
-        )
-      }
-      const repl = t.switchStatement(t.identifier(key), body)
-      path.get('body.body.1').replaceWith(repl)
       info_key[key].visit = 1
     },
   })
@@ -782,7 +893,9 @@ function ProcessWhile(ast) {
           }
           eval(c)
           line.push(c)
-        } catch {}
+        } catch {
+          //
+        }
       }
       line.push(code)
       line.push(name)
@@ -843,17 +956,21 @@ export default function (code) {
   traverse(ast, {
     BlockStatement: { exit: LintBlock },
   })
-  // Extract methods
+  // Get control vars in switch
   CollectVars(ast)
+  // Convert if-else to switch
   FlattenIf(ast)
-  UpdateRef(ast)
-  FlattenSwitch(ast)
+  // Convert some for to while
   FlattenFor(ast)
-  // Post Lint
+  // After the conversion, we should split some expressions,
+  // to help get constant test results in the if statement.
   // The Variable Declaration list must be splitted first
   SplitVarDef(ast)
   // Then, the assignment should be splitted
   MoveAssignment(ast)
+  // Merge switch case
+  FlattenSwitch(ast)
+  // Post Lint
   // The string can be merged
   MergeString(ast)
   // Simplify while that contains String.fromCharCode
