@@ -543,11 +543,14 @@ function FlattenSwitch(ast) {
   }
   // Merge switch
   let updated
-  function dfs3(cases, vis, body, update, key, value) {
-    if (update && value in vis) {
-      return
+  function dfs3(cases, vis, body, update, key, value, queue) {
+    if (update) {
+      if (value in vis) {
+        return
+      }
+      vis[value] = 1
+      queue.push(value)
     }
-    vis[value] = 1
     let valid = true
     let last = -1
     while (valid) {
@@ -560,7 +563,7 @@ function FlattenSwitch(ast) {
         const choices = [body.at(-1).consequent, body.at(-1).alternate]
         const ret = []
         for (let c of choices) {
-          ret.push(dfs3(cases, vis, c.body, false, key, value))
+          ret.push(dfs3(cases, vis, c.body, false, key, value, queue))
         }
         if (t.isBooleanLiteral(test) || t.isNumericLiteral(test)) {
           let add = 0
@@ -611,7 +614,7 @@ function FlattenSwitch(ast) {
           break
         }
         if (info_key[key].value[next] > 1) {
-          dfs3(cases, vis, cases[next], true, key, next)
+          dfs3(cases, vis, cases[next], true, key, next, queue)
           last = next
           break
         }
@@ -637,8 +640,19 @@ function FlattenSwitch(ast) {
       const path_switch = path.get(`body.body.${idx}`)
       const start = info_key[key].start
       // Helper func
-      let replace_switch = (nodes) => {
+      let replace_switch = (nodes, queue) => {
         let body = []
+        while (queue.length) {
+          let value = queue.shift()
+          if (value in nodes) {
+            body.push(
+              t.switchCase(t.numericLiteral(Number.parseInt(value)), [
+                t.blockStatement(nodes[value]),
+              ])
+            )
+            delete nodes[value]
+          }
+        }
         for (let value in nodes) {
           body.push(
             t.switchCase(t.numericLiteral(Number.parseInt(value)), [
@@ -671,7 +685,7 @@ function FlattenSwitch(ast) {
       let candidate = Object.keys(info_key[key].value)
       dfs2(path_switch, candidate, key, cases)
       // Update first
-      replace_switch(cases)
+      replace_switch(cases, [])
       updated = true
       while (updated) {
         updated = false
@@ -679,9 +693,10 @@ function FlattenSwitch(ast) {
         path.traverse(visitor_binary)
         cases = collect_switch()
         // Marge cases
-        dfs3(cases, {}, cases[start], true, key, start)
+        let que = []
+        dfs3(cases, {}, cases[start], true, key, start, que)
         // Replace
-        replace_switch(cases)
+        replace_switch(cases, que)
         // Get the summary of this switch case
         update_ref()
       }
